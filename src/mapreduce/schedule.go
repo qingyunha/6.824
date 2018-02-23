@@ -33,10 +33,19 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	//
 	// Your code here (Part III, Part IV).
 	//
-	var wg sync.WaitGroup
+	var wg, done sync.WaitGroup
 	var workers = make(chan string, 5)
 	var worker string
-	for i := 0; i < ntasks; i++ {
+	var tasksChan = make(chan int)
+	go func() {
+		for i := 0; i < ntasks; i++ {
+			tasksChan <- i
+			done.Add(1)
+		}
+		done.Wait()
+		close(tasksChan)
+	}()
+	for i := range tasksChan {
 		var args DoTaskArgs
 		args.JobName = jobName
 		if phase == mapPhase {
@@ -51,11 +60,16 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		case worker = <-workers:
 		}
 		wg.Add(1)
-		go func(worker string) {
-			call(worker, "Worker.DoTask", args, nil)
-			wg.Done()
-			workers <- worker
-		}(worker)
+		go func(worker string, args DoTaskArgs) {
+			if r := call(worker, "Worker.DoTask", args, nil); r {
+				done.Done()
+				wg.Done()
+				workers <- worker
+			} else {
+				tasksChan <- args.TaskNumber
+				wg.Done()
+			}
+		}(worker, args)
 	}
 	wg.Wait()
 	fmt.Printf("Schedule: %v done\n", phase)
