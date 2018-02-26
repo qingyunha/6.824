@@ -21,6 +21,7 @@ import "sync"
 import "labrpc"
 import "math/rand"
 import "time"
+import "fmt"
 
 // import "bytes"
 // import "labgob"
@@ -59,6 +60,8 @@ type Raft struct {
 	log         []map[int]interface{}
 
 	voteNum int
+
+	electionTimeout *time.Timer
 }
 
 // return currentTerm and whether this server
@@ -138,12 +141,16 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	fmt.Printf("---------------------- %v\n", rf.votedFor)
+	fmt.Printf("[%d] get voterequest from %d\n", rf.me, args.CandidateId)
 	if args.Term < rf.currentTerm || rf.votedFor != -1 {
 		reply.VoteGranted = false
 	} else {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 	}
+	fmt.Printf("[%d] votefor %d %v\n", rf.me, rf.votedFor, reply.VoteGranted)
+	fmt.Printf("---------------------- %v\n", rf.votedFor)
 }
 
 //
@@ -177,6 +184,33 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+	Entries  []interface{}
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.electionTimeout != nil {
+		rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
+	}
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+	} else {
+		reply.Success = true
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -236,9 +270,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func() {
 		//election periodically
 		for {
-			timeout := time.Duration(rand.Int31n(1000) + 500)
-			time.Sleep(timeout * time.Millisecond)
-			if true {
+			timeout := time.Duration(rand.Int31n(1000)+500) * time.Millisecond
+			fmt.Printf("[%d] start election with timeout %v\n", me, timeout)
+			rf.electionTimeout = time.NewTimer(timeout)
+			<-rf.electionTimeout.C
+			fmt.Printf("[%d] start election with timeout %v done!\n", me, timeout)
+			if !rf.electionTimeout.Stop() {
+				rf.currentTerm += 1
 				rf.voteNum = 0
 				rf.votedFor = -1
 				args := &RequestVoteArgs{}
@@ -246,10 +284,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				args.CandidateId = rf.me
 				reply := &RequestVoteReply{}
 				for i, _ := range rf.peers {
+					fmt.Printf("*****************************\n")
+					fmt.Printf("[%d] send vote to %d\n", me, i)
 					rf.sendRequestVote(i, args, reply)
 					if reply.VoteGranted {
 						rf.voteNum += 1
+						fmt.Printf("[%d] got vote by %d  now:%d\n", me, i, rf.voteNum)
 					}
+					fmt.Printf("*****************************\n")
+				}
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			time.Sleep(300 * time.Millisecond)
+			if _, isLeader := rf.GetState(); isLeader {
+				args := &AppendEntriesArgs{}
+				args.Term = rf.currentTerm
+				args.LeaderId = rf.me
+				reply := &AppendEntriesReply{}
+				for i, _ := range rf.peers {
+					rf.sendAppendEntries(i, args, reply)
 				}
 			}
 		}
