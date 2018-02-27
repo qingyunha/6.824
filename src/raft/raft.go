@@ -17,14 +17,24 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
-import "math/rand"
-import "time"
-import "fmt"
+import (
+	"fmt"
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
+
+type state string
+
+const (
+	Follower  state = "follower"
+	Candidate state = "candidate"
+	Leader    state = "leaders"
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -62,6 +72,7 @@ type Raft struct {
 	voteNum int
 
 	electionTimeout *time.Timer
+	state           state
 }
 
 // return currentTerm and whether this server
@@ -72,7 +83,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	term = rf.currentTerm
-	isleader = rf.voteNum >= len(rf.peers)/2
+	isleader = (rf.state == Leader)
 	return term, isleader
 }
 
@@ -141,16 +152,28 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	fmt.Printf("---------------------- %v\n", rf.votedFor)
-	fmt.Printf("[%d] get voterequest from %d\n", rf.me, args.CandidateId)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.voteNum = 0
+		fmt.Printf("[%d]!!! get voterequest with HIGH TERM %d\n", rf.me, args.Term)
+	}
+	fmt.Printf("[%d]--- get voterequest from %d\n", rf.me, args.CandidateId)
 	if args.Term < rf.currentTerm || rf.votedFor != -1 {
 		reply.VoteGranted = false
 	} else {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 	}
-	fmt.Printf("[%d] votefor %d %v\n", rf.me, rf.votedFor, reply.VoteGranted)
-	fmt.Printf("---------------------- %v\n", rf.votedFor)
+	fmt.Printf("[%d]--- votefor %d %v\n", rf.me, rf.votedFor, reply.VoteGranted)
+}
+
+func (rf *Raft) voteSelf() {
+	rf.votedFor = rf.me
+	rf.voteNum += 1
 }
 
 //
@@ -199,6 +222,15 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.voteNum = 0
+		fmt.Printf("[%d] get AppendEntries with HIGH TERM %d\n", rf.me, args.Term)
+	}
 	if rf.electionTimeout != nil {
 		rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
 	}
@@ -266,49 +298,93 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = Follower
 	rf.votedFor = -1
+	rf.currentTerm = 1
 	go func() {
 		//election periodically
 		for {
 			timeout := time.Duration(rand.Int31n(1000)+500) * time.Millisecond
-			fmt.Printf("[%d] start election with timeout %v\n", me, timeout)
 			rf.electionTimeout = time.NewTimer(timeout)
 			<-rf.electionTimeout.C
-			fmt.Printf("[%d] start election with timeout %v done!\n", me, timeout)
-			if !rf.electionTimeout.Stop() {
-				rf.currentTerm += 1
-				rf.voteNum = 0
-				rf.votedFor = -1
+			if !rf.electionTimeout.Stop() && rf.state != Leader {
+				rf.mu.Lock()
+				if rf.votedFor != -1 {
+					rf.currentTerm += 1
+				}
+				fmt.Printf("[%d] start election state:%s term:%d\n", me, rf.state, rf.currentTerm)
+				rf.state = Candidate
+				// voteself
+				rf.voteNum = 1
+				rf.votedFor = me
+				rf.mu.Unlock()
+
+				wg := sync.WaitGroup{}
 				args := &RequestVoteArgs{}
 				args.Term = rf.currentTerm
 				args.CandidateId = rf.me
 				reply := &RequestVoteReply{}
 				for i, _ := range rf.peers {
-					fmt.Printf("*****************************\n")
-					fmt.Printf("[%d] send vote to %d\n", me, i)
-					rf.sendRequestVote(i, args, reply)
-					if reply.VoteGranted {
-						rf.voteNum += 1
-						fmt.Printf("[%d] got vote by %d  now:%d\n", me, i, rf.voteNum)
+					if i == me {
+						continue
 					}
-					fmt.Printf("*****************************\n")
+					wg.Add(1)
+					go func(i int, args *RequestVoteArgs, reply *RequestVoteReply) {
+						fmt.Printf("[%d]*** send vote to %d\n", me, i)
+						result := make(chan bool)
+						timeout := make(chan bool)
+						go func() {
+							result <- rf.sendRequestVote(i, args, reply)
+						}()
+						go func() {
+							time.Sleep(500 * time.Millisecond)
+							timeout <- true
+						}()
+						select {
+						case <-result:
+							if reply.Term > rf.currentTerm {
+								rf.currentTerm = reply.Term
+								rf.state = Follower
+							} else {
+								if reply.VoteGranted {
+									rf.voteNum += 1
+									fmt.Printf("[%d]*** got vote by %d  now:%d\n", me, i, rf.voteNum)
+									if rf.voteNum > len(rf.peers)/2 {
+										rf.state = Leader
+										fmt.Printf("[%d] now I'm the learder term:%d voteNum:%d!!!\n", me, rf.currentTerm, rf.voteNum)
+									}
+								}
+							}
+						case <-timeout:
+							fmt.Printf("[%d]*** wait %d vote replay timeout\n", me, i)
+						}
+						wg.Done()
+						fmt.Printf("[%d]*** send vote to %d done\n", me, i)
+					}(i, args, reply)
 				}
+				wg.Wait()
 			}
 		}
 	}()
 
 	go func() {
 		for {
-			time.Sleep(300 * time.Millisecond)
 			if _, isLeader := rf.GetState(); isLeader {
 				args := &AppendEntriesArgs{}
 				args.Term = rf.currentTerm
 				args.LeaderId = rf.me
 				reply := &AppendEntriesReply{}
 				for i, _ := range rf.peers {
-					rf.sendAppendEntries(i, args, reply)
+					go func(i int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+						rf.sendAppendEntries(i, args, reply)
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.state = Follower
+						}
+					}(i, args, reply)
 				}
 			}
+			time.Sleep(300 * time.Millisecond)
 		}
 	}()
 	// initialize from state persisted before a crash
