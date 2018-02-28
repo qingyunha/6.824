@@ -342,7 +342,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						}()
 						select {
 						case <-result:
-							if reply.Term > rf.currentTerm {
+							if args.Term != rf.currentTerm || rf.state != Candidate {
+								fmt.Printf("[%d]***  discovers new term %d in Candidate\n", me, rf.currentTerm)
+							} else if reply.Term > rf.currentTerm {
 								rf.currentTerm = reply.Term
 								rf.state = Follower
 							} else {
