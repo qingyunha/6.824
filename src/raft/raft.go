@@ -86,6 +86,8 @@ type Raft struct {
 	applyCh chan ApplyMsg
 
 	becomeLeader chan bool
+
+	nextIndex []int
 }
 
 // return currentTerm and whether this server
@@ -247,18 +249,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.electionTimeout != nil {
 		rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
 	}
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-	} else if len(rf.log)-1 < args.PrevLogIndex {
-		reply.Success = false
-	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.log = rf.log[:args.PrevLogIndex+1]
-		reply.Success = true
-	} else {
+	if args.Term == rf.currentTerm {
 		reply.Success = true
 	}
-	if reply.Success == true {
-		rf.log = append(rf.log, args.Entries...)
+	if len(args.Entries) > 0 && reply.Success {
+		if len(rf.log)-1 < args.PrevLogIndex {
+			reply.Success = false
+			return
+		}
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			rf.log = rf.log[:args.PrevLogIndex+1]
+		}
+		rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
 		if args.LeaderCommit > rf.commitIndex {
 			if len(rf.log) > args.LeaderCommit {
 				rf.commitIndex = args.LeaderCommit
@@ -267,12 +269,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 		for i, e := range args.Entries {
-			msg := ApplyMsg{true, e.Command, len(rf.log) - 1 + i}
+			msg := ApplyMsg{true, e.Command, args.PrevLogIndex + 1 + i}
+			fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
 			rf.applyCh <- msg
 		}
-	}
-	if args.Entries != nil {
-		fmt.Printf("[%d] Got command %v, replay:%v\n", rf.me, args.Entries[0].Command, reply.Success)
+		fmt.Printf("[%d] Got command %v, replay:%v\n", rf.me, args.Entries[len(args.Entries)-1].Command, reply.Success)
 	}
 }
 
@@ -311,17 +312,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	entry := Entry{term, command}
 	rf.log = append(rf.log, entry)
 	index = len(rf.log) - 1
-	rf.mu.Unlock()
-	args := &AppendEntriesArgs{
-		Term:     term,
-		LeaderId: rf.me,
-
-		PrevLogIndex: index - 1,
-		PrevLogTerm:  rf.log[index-1].Term,
-
-		Entries: []Entry{entry},
+	args := make([]*AppendEntriesArgs, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		arg := &AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogIndex: rf.nextIndex[i] - 1,
+			LeaderCommit: rf.commitIndex,
+		}
+		arg.PrevLogTerm = rf.log[arg.PrevLogIndex].Term
+		arg.Entries = rf.log[rf.nextIndex[i]:]
+		args[i] = arg
 	}
-	reply := &AppendEntriesReply{}
+	rf.mu.Unlock()
 	done := make(chan bool)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -329,10 +335,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		go func(i int) {
 			for {
-				if rf.sendAppendEntries(i, args, reply) {
+				reply := &AppendEntriesReply{}
+				fmt.Printf("[%d] send to %d %+v\n", rf.me, i, args[i])
+				if rf.sendAppendEntries(i, args[i], reply) {
 					if reply.Success {
 						done <- true
+						rf.nextIndex[i] = index
 						break
+					} else {
+						fmt.Printf("[%d] send to %d failed. retry\n", rf.me, i)
+						time.Sleep(300 * time.Millisecond)
 					}
 				}
 			}
@@ -392,6 +404,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = []Entry{Entry{}}
 	rf.applyCh = applyCh
 	rf.becomeLeader = make(chan bool)
+
+	for i := 0; i < len(peers); i++ {
+		rf.nextIndex = append(rf.nextIndex, 1)
+	}
 
 	go func() {
 		//election periodically
