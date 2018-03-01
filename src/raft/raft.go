@@ -178,6 +178,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if args.Term < rf.currentTerm || rf.votedFor != -1 {
 		reply.VoteGranted = false
+	} else if args.LastLogIndex < len(rf.log)-1 {
+		reply.VoteGranted = false
 	} else {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
@@ -246,11 +248,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.voteNum = 0
 		fmt.Printf("[%d] get AppendEntries with HIGH TERM %d\n", rf.me, args.Term)
 	}
-	if rf.electionTimeout != nil {
-		rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
-	}
 	if args.Term == rf.currentTerm {
 		reply.Success = true
+		if rf.electionTimeout != nil {
+			rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
+		}
 	}
 	if len(args.Entries) > 0 && reply.Success {
 		if len(rf.log)-1 < args.PrevLogIndex {
@@ -260,7 +262,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			rf.log = rf.log[:args.PrevLogIndex+1]
 		}
-		rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 		if args.LeaderCommit > rf.commitIndex {
 			if len(rf.log) > args.LeaderCommit {
 				rf.commitIndex = args.LeaderCommit
@@ -273,7 +275,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
 			rf.applyCh <- msg
 		}
-		fmt.Printf("[%d] Got command %v, replay:%v\n", rf.me, args.Entries[len(args.Entries)-1].Command, reply.Success)
+		fmt.Printf("[%d] Got command %v, reply:%v logs:%v\n", rf.me, args.Entries[len(args.Entries)-1].Command, reply.Success, rf.log)
 	}
 }
 
@@ -336,15 +338,24 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		go func(i int) {
 			for {
 				reply := &AppendEntriesReply{}
+				args[i].PrevLogIndex = rf.nextIndex[i] - 1
+				args[i].PrevLogTerm = rf.log[args[i].PrevLogIndex].Term
+				args[i].Entries = rf.log[rf.nextIndex[i]:]
 				fmt.Printf("[%d] send to %d %+v\n", rf.me, i, args[i])
 				if rf.sendAppendEntries(i, args[i], reply) {
 					if reply.Success {
 						done <- true
-						rf.nextIndex[i] = index
+						rf.mu.Lock()
+						rf.nextIndex[i] = index + 1
+						rf.mu.Unlock()
 						break
 					} else {
-						fmt.Printf("[%d] send to %d failed. retry\n", rf.me, i)
-						time.Sleep(300 * time.Millisecond)
+						rf.mu.Lock()
+						if rf.nextIndex[i] > 1 {
+							rf.nextIndex[i] = rf.nextIndex[i] - 1
+						}
+						rf.mu.Unlock()
+						fmt.Printf("[%d] send to %d failed. retry nextIndex:%d\n", rf.me, i, rf.nextIndex[i])
 					}
 				}
 			}
@@ -352,7 +363,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	go func() {
-		for i := 1; i <= len(rf.peers)-1; i++ {
+		var i int
+		for i = 1; i <= len(rf.peers)-1; i++ {
 			<-done
 			if i+1 > len(rf.peers)/2 {
 				fmt.Printf("[%d] leader commit %v\n", rf.me, command)
@@ -363,6 +375,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				rf.applyCh <- msg
 				break
 			}
+		}
+		for i++; i <= len(rf.peers)-1; i++ {
+			<-done
 		}
 	}()
 	return index, term, isLeader
@@ -431,14 +446,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				args := &RequestVoteArgs{}
 				args.Term = rf.currentTerm
 				args.CandidateId = rf.me
-				reply := &RequestVoteReply{}
+				args.LastLogIndex = len(rf.log) - 1
 				for i, _ := range rf.peers {
 					if i == me {
 						continue
 					}
 					wg.Add(1)
-					go func(i int, args *RequestVoteArgs, reply *RequestVoteReply) {
+					go func(i int, args *RequestVoteArgs) {
 						fmt.Printf("[%d]*** send vote to %d\n", me, i)
+						reply := &RequestVoteReply{}
 						result := make(chan bool)
 						timeout := make(chan bool)
 						go func() {
@@ -470,10 +486,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							}
 							rf.mu.Unlock()
 						case <-timeout:
-							fmt.Printf("[%d]*** wait %d vote replay timeout\n", me, i)
+							fmt.Printf("[%d]*** wait %d vote reply timeout\n", me, i)
 						}
 						wg.Done()
-					}(i, args, reply)
+					}(i, args)
 				}
 				wg.Wait()
 			}
@@ -486,15 +502,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				args := &AppendEntriesArgs{}
 				args.Term = rf.currentTerm
 				args.LeaderId = rf.me
-				reply := &AppendEntriesReply{}
 				for i, _ := range rf.peers {
-					go func(i int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+					go func(i int, args *AppendEntriesArgs) {
+						reply := &AppendEntriesReply{}
 						rf.sendAppendEntries(i, args, reply)
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.state = Follower
 						}
-					}(i, args, reply)
+					}(i, args)
 				}
 				time.Sleep(300 * time.Millisecond)
 			} else {
