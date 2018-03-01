@@ -241,6 +241,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = Follower
@@ -337,12 +338,29 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		go func(i int) {
 			for {
+				if rf.state != Leader {
+					fmt.Printf("[%d] not leader. can't send log\n", rf.me)
+					done <- false
+					break
+				}
 				reply := &AppendEntriesReply{}
 				args[i].PrevLogIndex = rf.nextIndex[i] - 1
 				args[i].PrevLogTerm = rf.log[args[i].PrevLogIndex].Term
 				args[i].Entries = rf.log[rf.nextIndex[i]:]
+				args[i].Term = rf.currentTerm
 				fmt.Printf("[%d] send to %d %+v\n", rf.me, i, args[i])
 				if rf.sendAppendEntries(i, args[i], reply) {
+					if reply.Term > rf.currentTerm {
+						rf.mu.Lock()
+						rf.currentTerm = reply.Term
+						rf.state = Follower
+						rf.votedFor = -1
+						rf.voteNum = 0
+						rf.mu.Unlock()
+						done <- false
+						fmt.Printf("[%d] send log. got HIGH TERM %d\n", rf.me, reply.Term)
+						break
+					}
 					if reply.Success {
 						done <- true
 						rf.mu.Lock()
@@ -363,10 +381,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	go func() {
-		var i int
-		for i = 1; i <= len(rf.peers)-1; i++ {
-			<-done
-			if i+1 > len(rf.peers)/2 {
+		var i, count int = 1, 1
+		for ; i <= len(rf.peers)-1; i++ {
+			if <-done {
+				count += 1
+			}
+			if count > len(rf.peers)/2 {
 				fmt.Printf("[%d] leader commit %v\n", rf.me, command)
 				rf.mu.Lock()
 				rf.commitIndex = index
