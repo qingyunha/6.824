@@ -249,33 +249,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.voteNum = 0
 		fmt.Printf("[%d] get AppendEntries with HIGH TERM %d\n", rf.me, args.Term)
 	}
-	if args.Term == rf.currentTerm {
-		reply.Success = true
-		if rf.electionTimeout != nil {
-			rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
-		}
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
 	}
-	if len(args.Entries) > 0 && reply.Success {
-		if len(rf.log)-1 < args.PrevLogIndex {
-			reply.Success = false
-			return
-		}
-		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			rf.log = rf.log[:args.PrevLogIndex+1]
-		}
+	if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+	reply.Success = true
+	if rf.electionTimeout != nil {
+		rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
+	}
+	if len(args.Entries) > 0 {
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-		if args.LeaderCommit > rf.commitIndex {
-			if len(rf.log) > args.LeaderCommit {
-				rf.commitIndex = args.LeaderCommit
-			} else {
-				rf.commitIndex = len(rf.log)
-			}
+	}
+	lastCommitIndex := rf.commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		if len(rf.log)-1 > args.LeaderCommit {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = len(rf.log) - 1
 		}
-		for i, e := range args.Entries {
-			msg := ApplyMsg{true, e.Command, args.PrevLogIndex + 1 + i}
+		fmt.Printf("[%d] ---------%d, %d, %v\n", rf.me, lastCommitIndex, rf.commitIndex, rf.log)
+		for i, e := range rf.log[lastCommitIndex+1 : rf.commitIndex+1] {
+			msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
 			fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
 			rf.applyCh <- msg
 		}
+	}
+	if len(args.Entries) > 0 {
 		fmt.Printf("[%d] Got command %v, reply:%v logs:%v\n", rf.me, args.Entries[len(args.Entries)-1].Command, reply.Success, rf.log)
 	}
 }
@@ -311,9 +314,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Unlock()
 		return index, term, isLeader
 	}
-	fmt.Printf("[%d] Start command %v\n", rf.me, command)
 	entry := Entry{term, command}
 	rf.log = append(rf.log, entry)
+	fmt.Printf("[%d] Start command %v, log:%v, nextIndex:%v\n", rf.me, command, rf.log, rf.nextIndex)
 	index = len(rf.log) - 1
 	args := make([]*AppendEntriesArgs, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
@@ -387,13 +390,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				count += 1
 			}
 			if count > len(rf.peers)/2 {
-				fmt.Printf("[%d] leader commit %v\n", rf.me, command)
+				//fmt.Printf("[%d] leader commit %v\n", rf.me, command)
 				rf.mu.Lock()
-				rf.commitIndex = index
+				lastCommitIndex := rf.commitIndex
+				if rf.state != Leader || rf.currentTerm < term {
+					fmt.Printf("[%d] not leader. can't commit log\n", rf.me)
+					rf.mu.Unlock()
+					break
+				}
+				if index > lastCommitIndex {
+					rf.commitIndex = index
+				}
 				rf.mu.Unlock()
-				msg := ApplyMsg{true, command, index}
-				rf.applyCh <- msg
-				break
+
+				if lastCommitIndex < index {
+					fmt.Printf("[%d] ---------%d, %d, %v\n", rf.me, lastCommitIndex, rf.commitIndex, rf.log)
+					for i, e := range rf.log[lastCommitIndex+1 : index+1] {
+						msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
+						fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
+						rf.applyCh <- msg
+					}
+					break
+				}
 			}
 		}
 		for i++; i <= len(rf.peers)-1; i++ {
@@ -519,18 +537,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func() {
 		for {
 			if _, isLeader := rf.GetState(); isLeader {
-				args := &AppendEntriesArgs{}
-				args.Term = rf.currentTerm
-				args.LeaderId = rf.me
 				for i, _ := range rf.peers {
-					go func(i int, args *AppendEntriesArgs) {
+					go func(i int) {
+						args := &AppendEntriesArgs{}
+						args.Term = rf.currentTerm
+						args.LeaderId = rf.me
+						args.LeaderCommit = rf.commitIndex
+						args.PrevLogIndex = rf.nextIndex[i] - 1
+						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 						reply := &AppendEntriesReply{}
 						rf.sendAppendEntries(i, args, reply)
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.state = Follower
 						}
-					}(i, args)
+					}(i)
 				}
 				time.Sleep(300 * time.Millisecond)
 			} else {
