@@ -102,6 +102,66 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) follower2candidate() {
+	// times out, starts election
+	fmt.Printf("[%d] follower --> candidate\n", rf.me)
+	if rf.votedFor != -1 {
+		rf.currentTerm += 1
+	}
+	rf.state = Candidate
+	// voteself
+	rf.voteNum = 1
+	rf.votedFor = rf.me
+	fmt.Printf("[%d] start election state:%s term:%d\n", rf.me, rf.state, rf.currentTerm)
+}
+
+func (rf *Raft) candidate2leader() {
+	// receives votes from majority of servers
+	fmt.Printf("[%d] candidate --> Leader\n", rf.me)
+	rf.becomeLeader <- true
+	rf.state = Leader
+	fmt.Printf("[%d] now I'm the leader term:%d voteNum:%d!!!\n", rf.me, rf.currentTerm, rf.voteNum)
+}
+
+func (rf *Raft) leader2follower(term int) {
+	// discovers servers with high term
+	fmt.Printf("[%d] leader --> follower\n", rf.me)
+	rf.currentTerm = term
+	rf.voteNum = 0
+	rf.votedFor = -1
+	rf.state = Follower
+}
+
+func (rf *Raft) candidate2follower(term int) {
+	// discovers current leader or new term
+	fmt.Printf("[%d] candidate --> follower\n", rf.me)
+	if term > rf.currentTerm {
+		rf.voteNum = 0
+		rf.votedFor = -1
+	}
+	rf.currentTerm = term
+	rf.state = Follower
+}
+
+func (rf *Raft) candidate2candidate() {
+	fmt.Printf("[%d] candidate --> candidate\n", rf.me)
+	// times out, new election
+	rf.currentTerm += 1
+	// voteself
+	rf.voteNum = 1
+	rf.votedFor = rf.me
+	fmt.Printf("[%d] start election state:%s term:%d\n", rf.me, rf.state, rf.currentTerm)
+}
+
+func (rf *Raft) toFollowerWithHighTerm(term int) {
+	// discovers current leader or new term
+	fmt.Printf("[%d] %s --> follower *\n", rf.me, rf.state)
+	rf.voteNum = 0
+	rf.votedFor = -1
+	rf.currentTerm = term
+	rf.state = Follower
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -170,12 +230,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.state = Follower
-		rf.votedFor = -1
-		rf.voteNum = 0
 		fmt.Printf("[%d]!!! get voterequest with HIGH TERM %d\n", rf.me, args.Term)
+		rf.toFollowerWithHighTerm(args.Term)
 	}
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm || rf.votedFor != -1 {
 		reply.VoteGranted = false
 	} else if args.LastLogIndex < len(rf.log)-1 {
@@ -241,14 +299,11 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.state = Follower
-		rf.votedFor = -1
-		rf.voteNum = 0
+		rf.toFollowerWithHighTerm(args.Term)
 		fmt.Printf("[%d] get AppendEntries with HIGH TERM %d\n", rf.me, args.Term)
 	}
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -355,10 +410,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				if rf.sendAppendEntries(i, args[i], reply) {
 					if reply.Term > rf.currentTerm {
 						rf.mu.Lock()
-						rf.currentTerm = reply.Term
-						rf.state = Follower
-						rf.votedFor = -1
-						rf.voteNum = 0
+						rf.toFollowerWithHighTerm(reply.Term)
 						rf.mu.Unlock()
 						done <- false
 						fmt.Printf("[%d] send log. got HIGH TERM %d\n", rf.me, reply.Term)
@@ -468,16 +520,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			timeout := time.Duration(rand.Int31n(1000)+500) * time.Millisecond
 			rf.electionTimeout = time.NewTimer(timeout)
 			<-rf.electionTimeout.C
-			if !rf.electionTimeout.Stop() && rf.state != Leader {
+			if !rf.electionTimeout.Stop() {
 				rf.mu.Lock()
-				if rf.votedFor != -1 {
-					rf.currentTerm += 1
+				if rf.state == Follower {
+					rf.follower2candidate()
+				} else if rf.state == Candidate {
+					rf.candidate2candidate()
+				} else {
+					// leader pass electionTimeout
+					rf.mu.Unlock()
+					continue
 				}
-				fmt.Printf("[%d] start election state:%s term:%d\n", me, rf.state, rf.currentTerm)
-				rf.state = Candidate
-				// voteself
-				rf.voteNum = 1
-				rf.votedFor = me
 				rf.mu.Unlock()
 
 				wg := sync.WaitGroup{}
@@ -506,19 +559,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						case <-result:
 							rf.mu.Lock()
 							if args.Term != rf.currentTerm {
-								fmt.Printf("[%d]***  discovers new term:%d oldterm:%d. current state: %s\n", me, rf.currentTerm, args.Term, rf.state)
-							} else if reply.Term > rf.currentTerm {
-								rf.currentTerm = reply.Term
-								rf.state = Follower
-							} else {
+								rf.mu.Unlock()
+								fmt.Printf("[%d]*** discovers new term:%d oldterm:%d. current state: %s\n", me, rf.currentTerm, args.Term, rf.state)
+								break
+							}
+							if rf.state != Candidate {
+								rf.mu.Unlock()
+								fmt.Printf("[%d]*** not in Candidate state. term:%d state:%s \n", me, rf.currentTerm, rf.state)
+								break
+							}
+
+							if reply.Term > rf.currentTerm {
+								rf.candidate2follower(reply.Term)
+							} else if reply.Term == rf.currentTerm {
 								if reply.VoteGranted {
 									rf.voteNum += 1
 									if rf.voteNum > len(rf.peers)/2 {
-										if rf.state != Leader {
-											rf.becomeLeader <- true
-											fmt.Printf("[%d] now I'm the leader term:%d voteNum:%d!!!\n", me, rf.currentTerm, rf.voteNum)
-										}
-										rf.state = Leader
+										rf.candidate2leader()
 									}
 								}
 							}
@@ -547,9 +604,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 						reply := &AppendEntriesReply{}
 						rf.sendAppendEntries(i, args, reply)
+						// test before. avoid lock everytime
 						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-							rf.state = Follower
+							rf.mu.Lock()
+							if reply.Term > rf.currentTerm {
+								rf.leader2follower(reply.Term)
+							}
+							rf.mu.Unlock()
 						}
 					}(i)
 				}
