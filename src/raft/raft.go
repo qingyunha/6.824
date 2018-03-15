@@ -73,21 +73,17 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 
-	log []Entry
-
-	voteNum int
-
-	electionTimeout *time.Timer
 	state           state
-
-	commitIndex int
-	lastApplied int
+	voteNum         int
+	becomeLeader    chan bool
+	electionTimeout *time.Timer
 
 	applyCh chan ApplyMsg
 
-	becomeLeader chan bool
-
-	nextIndex []int
+	log         []Entry
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
 }
 
 // return currentTerm and whether this server
@@ -308,7 +304,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	lastIndex := len(rf.log) - 1
+	if lastIndex < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
@@ -316,15 +313,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.electionTimeout != nil {
 		rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
 	}
-	if len(args.Entries) > 0 {
+	if len(args.Entries) > lastIndex-args.PrevLogIndex {
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	}
-	lastCommitIndex := rf.commitIndex
 	if args.LeaderCommit > rf.commitIndex {
-		if len(rf.log)-1 > args.LeaderCommit {
-			rf.commitIndex = args.LeaderCommit
+		lastCommitIndex := rf.commitIndex
+		if lastIndex < args.LeaderCommit {
+			rf.commitIndex = lastIndex
 		} else {
-			rf.commitIndex = len(rf.log) - 1
+			rf.commitIndex = args.LeaderCommit
 		}
 		fmt.Printf("[%d] ---------%d, %d, %v\n", rf.me, lastCommitIndex, rf.commitIndex, rf.log)
 		for i, e := range rf.log[lastCommitIndex+1 : rf.commitIndex+1] {
@@ -371,8 +368,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	entry := Entry{term, command}
 	rf.log = append(rf.log, entry)
-	fmt.Printf("[%d] Start command %v, log:%v, nextIndex:%v\n", rf.me, command, rf.log, rf.nextIndex)
 	index = len(rf.log) - 1
+	fmt.Printf("[%d] Start command:%v index:%d, log:%v, nextIndex:%v\n", rf.me, command, index, rf.log, rf.nextIndex)
 	args := make([]*AppendEntriesArgs, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -397,7 +394,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		go func(i int) {
 			for {
 				if rf.state != Leader {
-					fmt.Printf("[%d] not leader. can't send log\n", rf.me)
+					fmt.Printf("[%d] (index:%d) not leader. can't send log\n", rf.me, index)
+					done <- false
+					break
+				}
+				if index != len(rf.log)-1 {
+					fmt.Printf("[%d] (index:%d) index change. can't send log\n", rf.me, index)
 					done <- false
 					break
 				}
@@ -406,31 +408,29 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				args[i].PrevLogTerm = rf.log[args[i].PrevLogIndex].Term
 				args[i].Entries = rf.log[rf.nextIndex[i]:]
 				args[i].Term = rf.currentTerm
-				fmt.Printf("[%d] send to %d %+v\n", rf.me, i, args[i])
+				fmt.Printf("[%d] (index:%d) replicate log to %d %+v\n", rf.me, index, i, args[i])
 				if rf.sendAppendEntries(i, args[i], reply) {
 					if reply.Term > rf.currentTerm {
+						fmt.Printf("[%d] (index:%d) send log. got HIGH TERM %d\n", rf.me, index, reply.Term)
 						rf.mu.Lock()
-						rf.toFollowerWithHighTerm(reply.Term)
+						if reply.Term > rf.currentTerm {
+							rf.toFollowerWithHighTerm(reply.Term)
+						}
 						rf.mu.Unlock()
 						done <- false
-						fmt.Printf("[%d] send log. got HIGH TERM %d\n", rf.me, reply.Term)
 						break
 					}
 					if reply.Success {
 						done <- true
-						rf.mu.Lock()
 						rf.nextIndex[i] = index + 1
-						rf.mu.Unlock()
 						break
 					} else {
-						rf.mu.Lock()
 						if rf.nextIndex[i] > 1 {
 							rf.nextIndex[i] = rf.nextIndex[i] - 1
 						}
-						rf.mu.Unlock()
-						fmt.Printf("[%d] send to %d failed. retry nextIndex:%d\n", rf.me, i, rf.nextIndex[i])
 					}
 				}
+				fmt.Printf("[%d] (index:%d) send to %d failed. retry nextIndex:%d\n", rf.me, index, i, rf.nextIndex[i])
 			}
 		}(i)
 	}
@@ -446,24 +446,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				rf.mu.Lock()
 				lastCommitIndex := rf.commitIndex
 				if rf.state != Leader || rf.currentTerm < term {
-					fmt.Printf("[%d] not leader. can't commit log\n", rf.me)
+					fmt.Printf("[%d] (index:%d) not leader. can't commit log\n", rf.me, index)
 					rf.mu.Unlock()
 					break
 				}
 				if index > lastCommitIndex {
 					rf.commitIndex = index
+					fmt.Printf("[%d] (index:%d) commitIndex from %d to %d\n", rf.me, index, lastCommitIndex, index)
 				}
-				rf.mu.Unlock()
 
 				if lastCommitIndex < index {
-					fmt.Printf("[%d] ---------%d, %d, %v\n", rf.me, lastCommitIndex, rf.commitIndex, rf.log)
 					for i, e := range rf.log[lastCommitIndex+1 : index+1] {
 						msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
-						fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
+						fmt.Printf("[%d] (index:%d) send ApplyMsg %+v\n", rf.me, index, msg)
 						rf.applyCh <- msg
 					}
+					rf.mu.Unlock()
 					break
 				}
+				rf.mu.Unlock()
 			}
 		}
 		for i++; i <= len(rf.peers)-1; i++ {
@@ -510,7 +511,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.becomeLeader = make(chan bool)
 
-	for i := 0; i < len(peers); i++ {
+	for _ = range peers {
 		rf.nextIndex = append(rf.nextIndex, 1)
 	}
 
