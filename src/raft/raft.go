@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"labrpc"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -84,6 +85,7 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 	nextIndex   []int
+	matchIndex  []int
 }
 
 // return currentTerm and whether this server
@@ -119,6 +121,7 @@ func (rf *Raft) candidate2leader() {
 	lastIndex := len(rf.log) - 1
 	for i := range rf.peers {
 		rf.nextIndex[i] = lastIndex + 1
+		rf.matchIndex[i] = 0
 	}
 	fmt.Printf("[%d] now I'm the leader term:%d log:%v\n", rf.me, rf.currentTerm, rf.log[1:])
 }
@@ -355,14 +358,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = args.LeaderCommit
 		}
-		if lastCommitIndex < rf.commitIndex {
-			fmt.Printf("[%d] apply from reqest:%+v lastCommitIndex:%d commitIndex:%d log:%v\n", rf.me, args, lastCommitIndex, rf.commitIndex, rf.log[1:])
-		}
-		for i, e := range rf.log[lastCommitIndex+1 : rf.commitIndex+1] {
-			msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
-			fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
-			rf.applyCh <- msg
-		}
+		//if lastCommitIndex < rf.commitIndex {
+		//fmt.Printf("[%d] apply from reqest:%+v lastCommitIndex:%d commitIndex:%d log:%v\n", rf.me, args, lastCommitIndex, rf.commitIndex, rf.log[1:])
+		//}
+		go func(start, end int) {
+			for i, e := range rf.log[start+1 : end+1] {
+				msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
+				fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
+				rf.applyCh <- msg
+			}
+		}(lastCommitIndex, rf.commitIndex)
 	}
 	if len(args.Entries) > 0 {
 		fmt.Printf("[%d] < commitIndex:%d, log:%v\n", rf.me, rf.commitIndex, rf.log[1:])
@@ -388,7 +393,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-
 	index := -1
 	term := -1
 	isLeader := true
@@ -404,107 +408,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, entry)
 	index = len(rf.log) - 1
 	fmt.Printf("[%d] Start command:%v index:%d, term:%d, log:%v, nextIndex:%v\n", rf.me, command, index, term, rf.log[1:], rf.nextIndex)
-	args := make([]*AppendEntriesArgs, len(rf.peers))
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		arg := &AppendEntriesArgs{
-			Term:         term,
-			LeaderId:     rf.me,
-			PrevLogIndex: rf.nextIndex[i] - 1,
-			LeaderCommit: rf.commitIndex,
-		}
-		arg.PrevLogTerm = rf.log[arg.PrevLogIndex].Term
-		arg.Entries = rf.log[rf.nextIndex[i]:]
-		args[i] = arg
-	}
 	rf.mu.Unlock()
-	done := make(chan bool)
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		go func(i int) {
-			for {
-				if rf.state != Leader {
-					fmt.Printf("[%d] (index:%d) not leader. can't send log\n", rf.me, index)
-					done <- false
-					break
-				}
-				if index != len(rf.log)-1 {
-					fmt.Printf("[%d] (index:%d) index change. can't send log\n", rf.me, index)
-					done <- false
-					break
-				}
-				reply := &AppendEntriesReply{}
-				args[i].PrevLogIndex = rf.nextIndex[i] - 1
-				args[i].PrevLogTerm = rf.log[args[i].PrevLogIndex].Term
-				args[i].Entries = rf.log[rf.nextIndex[i]:]
-				args[i].Term = rf.currentTerm
-				fmt.Printf("[%d] (index:%d) replicate log to %d %+v\n", rf.me, index, i, args[i])
-				if rf.sendAppendEntries(i, args[i], reply) {
-					if reply.Term > rf.currentTerm {
-						fmt.Printf("[%d] (index:%d) send log. got HIGH TERM %d\n", rf.me, index, reply.Term)
-						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							rf.toFollowerWithHighTerm(reply.Term)
-						}
-						rf.mu.Unlock()
-						done <- false
-						break
-					}
-					if reply.Success {
-						done <- true
-						rf.nextIndex[i] = index + 1
-						break
-					} else {
-						if rf.nextIndex[i] > 1 {
-							rf.nextIndex[i] = rf.nextIndex[i] - 1
-						}
-					}
-				}
-				fmt.Printf("[%d] (index:%d) send to %d failed. retry nextIndex:%d\n", rf.me, index, i, rf.nextIndex[i])
-			}
-		}(i)
-	}
-
-	go func() {
-		var i, count int = 1, 1
-		for ; i <= len(rf.peers)-1; i++ {
-			if <-done {
-				count += 1
-			}
-			if count > len(rf.peers)/2 {
-				//fmt.Printf("[%d] leader commit %v\n", rf.me, command)
-				rf.mu.Lock()
-				lastCommitIndex := rf.commitIndex
-				if rf.state != Leader || rf.currentTerm < term {
-					fmt.Printf("[%d] (index:%d) not leader. can't commit log\n", rf.me, index)
-					rf.mu.Unlock()
-					break
-				}
-				if index > lastCommitIndex {
-					rf.commitIndex = index
-					fmt.Printf("[%d] (index:%d) commitIndex from %d to %d\n", rf.me, index, lastCommitIndex, index)
-				}
-
-				if lastCommitIndex < index {
-					for i, e := range rf.log[lastCommitIndex+1 : index+1] {
-						msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
-						fmt.Printf("[%d] (index:%d) send ApplyMsg %+v\n", rf.me, index, msg)
-						rf.applyCh <- msg
-					}
-					rf.mu.Unlock()
-					break
-				}
-				rf.mu.Unlock()
-			}
-		}
-		for i++; i <= len(rf.peers)-1; i++ {
-			<-done
-		}
-	}()
 	return index, term, isLeader
 }
 
@@ -547,6 +451,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	for _ = range peers {
 		rf.nextIndex = append(rf.nextIndex, 1)
+		rf.matchIndex = append(rf.matchIndex, 0)
 	}
 
 	go func() {
@@ -574,7 +479,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.mu.Unlock()
 
 				wg := sync.WaitGroup{}
-				for i, _ := range rf.peers {
+				for i := range rf.peers {
 					if i == me {
 						continue
 					}
@@ -627,31 +532,84 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}()
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
 	go func() {
 		for {
 			if _, isLeader := rf.GetState(); isLeader {
-				for i, _ := range rf.peers {
+				for i := range rf.peers {
+					if i == rf.me {
+						continue
+					}
 					go func(i int) {
-						args := &AppendEntriesArgs{}
 						rf.mu.Lock()
+						index := len(rf.log) - 1
+						args := &AppendEntriesArgs{}
 						args.Term = rf.currentTerm
 						args.LeaderId = rf.me
 						args.LeaderCommit = rf.commitIndex
-						// workaround to avoid follower commit wrong Entry
-						args.PrevLogIndex = len(rf.log) - 1
+						args.PrevLogIndex = rf.nextIndex[i] - 1
 						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+						args.Entries = rf.log[rf.nextIndex[i]:]
 						rf.mu.Unlock()
 						reply := &AppendEntriesReply{}
-						rf.sendAppendEntries(i, args, reply)
-						// test before. avoid lock everytime
-						if reply.Term > rf.currentTerm {
+						if len(args.Entries) > 0 {
+							fmt.Printf("[%d] (index:%d) replicate log to %d %+v\n", rf.me, index, i, args)
+						}
+						if rf.sendAppendEntries(i, args, reply) {
 							rf.mu.Lock()
 							if reply.Term > rf.currentTerm {
-								rf.leader2follower(reply.Term)
+								fmt.Printf("[%d] (index:%d) send log. got HIGH TERM %d\n", rf.me, index, reply.Term)
+								rf.toFollowerWithHighTerm(reply.Term)
+							}
+							if rf.state != Leader {
+								rf.mu.Unlock()
+								return
+							}
+							if reply.Success {
+								if index >= rf.nextIndex[i] {
+									rf.nextIndex[i] = index + 1
+								}
+								if index >= rf.matchIndex[i] {
+									rf.matchIndex[i] = index
+								}
+								//fmt.Printf("[%d] replicate log to %d success. index:%d, nextIndex:%d, matchIndex:%d\n", rf.me, i, index, rf.nextIndex[i], rf.matchIndex[i])
+							} else {
+								if rf.nextIndex[i] > 1 && args.PrevLogIndex == rf.nextIndex[i]-1 {
+									rf.nextIndex[i] = args.PrevLogIndex - 1
+								}
+								fmt.Printf("[%d] (index:%d) send to %d failed. retry nextIndex:%d\n", rf.me, index, i, rf.nextIndex[i])
 							}
 							rf.mu.Unlock()
 						}
 					}(i)
+				}
+
+				lastCommitIndex := rf.commitIndex
+				rf.matchIndex[rf.me] = len(rf.log) - 1
+				sorted := make([]int, len(rf.matchIndex))
+				copy(sorted, rf.matchIndex)
+				sort.Sort(sort.Reverse(sort.IntSlice(sorted)))
+				for i, m := range sorted {
+					if i+1 > len(rf.peers)/2 {
+						if m > rf.commitIndex {
+							rf.commitIndex = m
+						}
+						break
+					}
+					if m <= rf.commitIndex {
+						break
+					}
+				}
+				if rf.commitIndex > lastCommitIndex {
+					go func(before, end int) {
+						for i, e := range rf.log[before+1 : end+1] {
+							msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
+							fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
+							rf.applyCh <- msg
+						}
+					}(lastCommitIndex, rf.commitIndex)
 				}
 				time.Sleep(300 * time.Millisecond)
 			} else {
@@ -659,8 +617,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}
 		}
 	}()
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
 	return rf
 }
