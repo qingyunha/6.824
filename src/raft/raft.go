@@ -232,12 +232,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	var msg string = "ok"
 	if args.Term > rf.currentTerm {
 		fmt.Printf("[%d]!!! get voterequest with HIGH TERM %d\n", rf.me, args.Term)
 		rf.toFollowerWithHighTerm(args.Term)
 	}
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm || rf.votedFor != -1 {
+		if rf.votedFor != -1 {
+			msg = fmt.Sprintf("already vote for %d", rf.votedFor)
+		} else {
+			msg = "low term"
+		}
 		reply.VoteGranted = false
 	} else {
 		lastIndex := len(rf.log) - 1
@@ -248,9 +254,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if rf.electionTimeout != nil {
 				rf.electionTimeout.Reset(time.Duration(rand.Int31n(1000)+500) * time.Millisecond)
 			}
+		} else {
+			if args.LastLogTerm < lastTerm {
+				msg = "low last Term"
+			}
+			if args.LastLogIndex < lastIndex {
+				msg = "low last index"
+			}
 		}
 	}
-	fmt.Printf("[%d]--- votefor %d %v\n", rf.me, args.CandidateId, reply.VoteGranted)
+	fmt.Printf("[%d]--- votefor %d. %v %s\n", rf.me, args.CandidateId, reply.VoteGranted, msg)
 }
 
 //
@@ -330,7 +343,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	reply.Success = true
 	if len(args.Entries) > 0 {
-		fmt.Printf("[%d] > commitIndex:%d, log:%v\n    prevlogindex:%d, new:%v\n", rf.me, rf.commitIndex, rf.log[1:], args.PrevLogIndex, args.Entries)
+		//fmt.Printf("[%d] > commitIndex:%d, log:%v\n    prevlogindex:%d, new:%v\n", rf.me, rf.commitIndex, rf.log[1:], args.PrevLogIndex, args.Entries)
 	}
 	leaderLastIndex := args.PrevLogIndex + len(args.Entries)
 	if lastIndex < leaderLastIndex {
@@ -364,13 +377,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go func(start, end int) {
 			for i, e := range rf.log[start+1 : end+1] {
 				msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
-				fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
+				//fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
 				rf.applyCh <- msg
 			}
 		}(lastCommitIndex, rf.commitIndex)
 	}
 	if len(args.Entries) > 0 {
-		fmt.Printf("[%d] < commitIndex:%d, log:%v\n", rf.me, rf.commitIndex, rf.log[1:])
+		//fmt.Printf("[%d] < commitIndex:%d, log:%v\n", rf.me, rf.commitIndex, rf.log[1:])
 	}
 }
 
@@ -407,7 +420,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	entry := Entry{term, command}
 	rf.log = append(rf.log, entry)
 	index = len(rf.log) - 1
-	fmt.Printf("[%d] Start command:%v index:%d, term:%d, log:%v, nextIndex:%v\n", rf.me, command, index, term, rf.log[1:], rf.nextIndex)
+	//fmt.Printf("[%d] Start command:%v index:%d, term:%d, log:%v, nextIndex:%v\n", rf.me, command, index, term, rf.log[1:], rf.nextIndex)
 	rf.mu.Unlock()
 	return index, term, isLeader
 }
@@ -485,7 +498,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					}
 					wg.Add(1)
 					go func(i int, args *RequestVoteArgs) {
-						fmt.Printf("[%d]*** send vote to %d\n", me, i)
+						//fmt.Printf("[%d]*** send vote to %d\n", me, i)
 						reply := &RequestVoteReply{}
 						result := make(chan bool)
 						timeout := make(chan bool)
@@ -522,12 +535,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							}
 							rf.mu.Unlock()
 						case <-timeout:
-							fmt.Printf("[%d]*** wait %d vote reply timeout\n", me, i)
+							//fmt.Printf("[%d]*** wait %d vote reply timeout\n", me, i)
 						}
 						wg.Done()
 					}(i, args)
 				}
 				wg.Wait()
+				rf.mu.Lock()
+				if rf.state == Candidate {
+					rf.votedFor = -1
+				}
+				rf.mu.Unlock()
 			}
 		}
 	}()
@@ -555,7 +573,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.mu.Unlock()
 						reply := &AppendEntriesReply{}
 						if len(args.Entries) > 0 {
-							fmt.Printf("[%d] (index:%d) replicate log to %d %+v\n", rf.me, index, i, args)
+							//fmt.Printf("[%d] (index:%d) replicate log to %d %+v\n", rf.me, index, i, args)
 						}
 						if rf.sendAppendEntries(i, args, reply) {
 							rf.mu.Lock()
@@ -577,7 +595,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								//fmt.Printf("[%d] replicate log to %d success. index:%d, nextIndex:%d, matchIndex:%d\n", rf.me, i, index, rf.nextIndex[i], rf.matchIndex[i])
 							} else {
 								if rf.nextIndex[i] > 1 && args.PrevLogIndex == rf.nextIndex[i]-1 {
-									rf.nextIndex[i] = args.PrevLogIndex - 1
+									rf.nextIndex[i] = args.PrevLogIndex / 2
 								}
 								fmt.Printf("[%d] (index:%d) send to %d failed. retry nextIndex:%d\n", rf.me, index, i, rf.nextIndex[i])
 							}
@@ -606,7 +624,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					go func(before, end int) {
 						for i, e := range rf.log[before+1 : end+1] {
 							msg := ApplyMsg{true, e.Command, lastCommitIndex + 1 + i}
-							fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
+							//fmt.Printf("[%d] send ApplyMsg %+v\n", rf.me, msg)
 							rf.applyCh <- msg
 						}
 					}(lastCommitIndex, rf.commitIndex)
