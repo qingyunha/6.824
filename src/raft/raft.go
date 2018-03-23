@@ -500,8 +500,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					go func(i int, args *RequestVoteArgs) {
 						//fmt.Printf("[%d]*** send vote to %d\n", me, i)
 						reply := &RequestVoteReply{}
-						result := make(chan bool)
-						timeout := make(chan bool)
+						result := make(chan bool, 1)
+						timeout := make(chan bool, 1)
 						go func() {
 							result <- rf.sendRequestVote(i, args, reply)
 						}()
